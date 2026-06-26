@@ -1,0 +1,75 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# --- Large binaries / wheels ---
+*.whl
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# --- Models & reward weights (download locally) ---
+models/
+!models/.gitkeep
+
+# --- Raw IU-Xray data (register & download separately) ---
+data/archive.zip
+data/raw/
+
+# --- Processed data: keep json/jsonl; ignore large exports if any ---
+# data/sft/ and data/grpo/ are tracked by default
+
+# --- Training checkpoints ---
+checkpoints/
+
+# Optional: track small LoRA adapters via Git LFS (uncomment if using LFS)
+# !checkpoints/grpo/iu_xray_group_b/global_step_70/actor/lora_adapter/
+# !checkpoints/grpo/iu_xray_group_b/global_step_70/actor/lora_adapter/**
+# !checkpoints/qwen25vl-iu-sft-lora/checkpoint-800/
+# !checkpoints/qwen25vl-iu-sft-lora/checkpoint-800/adapter_model.safetensors
+# !checkpoints/qwen25vl-iu-sft-lora/checkpoint-800/adapter_config.json
+
+# --- Experiment outputs ---
+outputs/
+!outputs/.gitkeep
+
+# --- Logs ---
+*.log
+nohup.out
+
+# --- Hugging Face / torch cache ---
+.cache/
+**/.cache/
+
+# --- EasyR1: install separately (pip install -e EasyR1/) ---
+# If you vendor a patched copy, remove this line and use a submodule instead.
+EasyR1/
+
+# --- Ray ---
+/tmp/ray/
+ray_results/
+
+# --- Secrets ---
+.env
+.env.*
+*.pem

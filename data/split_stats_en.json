@@ -1,0 +1,20 @@
+{
+  "min_text_len": 10,
+  "splits": {
+    "train": {
+      "num_samples": 2230,
+      "sft_file": "data/sft_en/train.json",
+      "grpo_file": "data/grpo_en/train.jsonl"
+    },
+    "val": {
+      "num_samples": 318,
+      "sft_file": "data/sft_en/val.json",
+      "grpo_file": "data/grpo_en/val.jsonl"
+    },
+    "test": {
+      "num_samples": 639,
+      "sft_file": "data/sft_en/test.json",
+      "grpo_file": "data/grpo_en/test.jsonl"
+    }
+  }
+}
