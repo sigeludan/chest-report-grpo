@@ -1,0 +1,30 @@
+{
+  "total": 318,
+  "format_rate": 0.89937106918239,
+  "format_passed": 286,
+  "mean_clinical_f1": 0.023892773892773892,
+  "clinical_evaluated": 286,
+  "examples": [
+    {
+      "id": "iu_0012",
+      "format_score": 1.0,
+      "clinical_score": 0.0,
+      "impression_pred": "1. 右下肺野斑片状阴影提示可能存在感染性病变，建议进一步检查以明确诊断。\n2. 无明显骨折或脱位。\n3. 其他胸腔结构未见异常。",
+      "impression_gt": "No acute cardiopulmonary abnormality."
+    },
+    {
+      "id": "iu_0028",
+      "format_score": 1.0,
+      "clinical_score": 0.0,
+      "impression_pred": "1. 双肺弥漫性小结节影，建议结合临床症状进一步检查，必要时行胸部CT增强扫描以明确诊断。\n2. 无明显心脏增大或其他严重结构性心脏病表现。\n3. 无明显胸膜腔积液或其他胸腔内病变。\n4. 胸部软组织未见异常。",
+      "impression_gt": "1. Interval improvement in consolidative left base opacity. Multifocal scattered bibasilar patchy and XXXX pulmonary opacities again noted, most consistent with atelectasis/infiltrate. 2. Stable enlarged cardiomediastinal silhouette. Stable pulmonary vascular congestion. ."
+    },
+    {
+      "id": "iu_0049",
+      "format_score": 1.0,
+      "clinical_score": 0.0,
+      "impression_pred": "胸部X线检查结果示：双肺野清晰，心脏大小正常，气管居中，胸膜腔未见积液。双侧肋骨、锁骨及肩胛骨未见骨折或异常改变。胸椎序列大致对称，椎间隙正常。胸壁软组织未见异常肿块或钙化灶。建议结合临床症状进一步评估。",
+      "impression_gt": "No acute cardiopulmonary disease."
+    }
+  ]
+}

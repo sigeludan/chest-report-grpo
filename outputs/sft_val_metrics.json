@@ -1,0 +1,30 @@
+{
+  "total": 318,
+  "format_rate": 1.0,
+  "format_passed": 318,
+  "mean_clinical_f1": 0.7473794549266247,
+  "clinical_evaluated": 318,
+  "examples": [
+    {
+      "id": "iu_0012",
+      "format_score": 1.0,
+      "clinical_score": 1.0,
+      "impression_pred": "No acute cardiopulmonary disease.",
+      "impression_gt": "No acute cardiopulmonary abnormality."
+    },
+    {
+      "id": "iu_0028",
+      "format_score": 1.0,
+      "clinical_score": 0.0,
+      "impression_pred": "No acute cardiopulmonary abnormalities.",
+      "impression_gt": "1. Interval improvement in consolidative left base opacity. Multifocal scattered bibasilar patchy and XXXX pulmonary opacities again noted, most consistent with atelectasis/infiltrate. 2. Stable enlarged cardiomediastinal silhouette. Stable pulmonary vascular congestion. ."
+    },
+    {
+      "id": "iu_0049",
+      "format_score": 1.0,
+      "clinical_score": 1.0,
+      "impression_pred": "No acute cardiopulmonary abnormalities.",
+      "impression_gt": "No acute cardiopulmonary disease."
+    }
+  ]
+}

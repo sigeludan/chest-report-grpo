@@ -1,0 +1,9 @@
+{
+  "total": 318,
+  "passed": 318,
+  "failed": 0,
+  "format_rate": 1.0,
+  "target_rate": 0.95,
+  "meets_target": true,
+  "failures": []
+}

@@ -49,10 +49,6 @@ checkpoints/
 # !checkpoints/qwen25vl-iu-sft-lora/checkpoint-800/adapter_model.safetensors
 # !checkpoints/qwen25vl-iu-sft-lora/checkpoint-800/adapter_config.json
 
-# --- Experiment outputs ---
-outputs/
-!outputs/.gitkeep
-
 # --- Logs ---
 *.log
 nohup.out

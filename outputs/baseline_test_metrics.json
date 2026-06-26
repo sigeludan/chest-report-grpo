@@ -1,0 +1,30 @@
+{
+  "total": 639,
+  "format_rate": 0.8716744913928013,
+  "format_passed": 557,
+  "mean_clinical_f1": 0.016457211250748054,
+  "clinical_evaluated": 557,
+  "examples": [
+    {
+      "id": "iu_0002",
+      "format_score": 0.0,
+      "clinical_score": 0.0,
+      "impression_pred": "",
+      "impression_gt": "No acute pulmonary findings."
+    },
+    {
+      "id": "iu_0004",
+      "format_score": 1.0,
+      "clinical_score": 0.0,
+      "impression_pred": "1. 双肺弥漫性小结节影，考虑为慢性炎症或感染后遗症可能性大。\n2. 无急性胸腔疾病证据。\n3. 需结合临床症状及病史进一步评估。",
+      "impression_gt": "1. Bullous emphysema and interstitial fibrosis. 2. Probably scarring in the left apex, although difficult to exclude a cavitary lesion. 3. Opacities in the bilateral upper lobes could represent scarring, however the absence of comparison exam, recommend short interval followup radiograph or CT thorax to document resolution."
+    },
+    {
+      "id": "iu_0008",
+      "format_score": 1.0,
+      "clinical_score": 0.0,
+      "impression_pred": "胸部X线检查结果示：双肺野透亮度均匀，未见明显异常。建议结合临床症状及体征进一步评估。",
+      "impression_gt": "No acute cardiopulmonary disease."
+    }
+  ]
+}
