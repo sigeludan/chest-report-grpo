@@ -99,6 +99,11 @@ worker:
     reward_function_kwargs:
       lambda_clinical: 1.0
       lambda_consistency: 0.3
+      r_normal: 1.0
+      gamma_fp: 0.25
+      gamma_fp_severe: 0.4
+      fbeta: 2.0
+      lambda_abnormal: 1.5
     num_cpus: 2
 
 trainer:

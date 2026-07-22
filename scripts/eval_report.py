@@ -41,7 +41,7 @@ def evaluate_records(records: list[dict]) -> dict:
         impression_pred = ""
         if parsed is not None and impression_gt:
             _, impression_pred = parsed
-            clinical_score = compute_clinical_reward(impression_pred, impression_gt)
+            clinical_score = compute_clinical_reward(impression_pred, impression_gt, use_v2=False)
             valid_clinical += 1
         clinical_scores.append(clinical_score)
 

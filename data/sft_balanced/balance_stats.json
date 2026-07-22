@@ -1,0 +1,16 @@
+{
+  "input_n": 2230,
+  "raw_abnormal": 577,
+  "raw_normal": 1653,
+  "normal_after_cap": 1261,
+  "output_n": 2293,
+  "output_abnormal": 1032,
+  "output_normal": 1261,
+  "output_abnormal_ratio": 0.4501,
+  "abnormal_weight": 1.6,
+  "normal_weight": 1.0,
+  "method": "hybrid",
+  "target_abnormal_ratio": 0.45,
+  "max_normal_template": 40,
+  "seed": 42
+}

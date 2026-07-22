@@ -1,10 +1,15 @@
-"""Clinical reward: CheXbert micro-F1 between predicted and GT impressions."""
+"""Clinical reward: asymmetric CheXbert score (normal branch + Fβ for abnormal)."""
 
 from __future__ import annotations
 
 from typing import Sequence
 
-from .chexbert_utils import CheXbertLabeler, micro_f1_positive, predict_labels
+from .chexbert_utils import (
+    CheXbertLabeler,
+    clinical_score_v2,
+    micro_f1_positive,
+    predict_labels,
+)
 from .format_reward import parse_ground_truth, parse_report
 
 
@@ -12,6 +17,13 @@ def compute_clinical_reward(
     impression_pred: str,
     impression_gt: str,
     labeler: CheXbertLabeler | None = None,
+    *,
+    use_v2: bool = True,
+    r_normal: float = 1.0,
+    gamma_fp: float = 0.25,
+    gamma_fp_severe: float = 0.4,
+    fbeta: float = 2.0,
+    lambda_abnormal: float = 1.5,
 ) -> float:
     """Compute R_clinical for a single sample."""
     impression_pred = impression_pred.strip()
@@ -21,6 +33,16 @@ def compute_clinical_reward(
 
     labeler = labeler or CheXbertLabeler.get()
     label_vectors = predict_labels([impression_pred, impression_gt], labeler=labeler)
+    if use_v2:
+        return clinical_score_v2(
+            label_vectors[0],
+            label_vectors[1],
+            r_normal=r_normal,
+            gamma_fp=gamma_fp,
+            gamma_fp_severe=gamma_fp_severe,
+            fbeta=fbeta,
+            lambda_abnormal=lambda_abnormal,
+        )
     return micro_f1_positive(label_vectors[0], label_vectors[1])
 
 
@@ -28,6 +50,13 @@ def compute_clinical_rewards(
     impression_preds: Sequence[str],
     impression_gts: Sequence[str],
     labeler: CheXbertLabeler | None = None,
+    *,
+    use_v2: bool = True,
+    r_normal: float = 1.0,
+    gamma_fp: float = 0.25,
+    gamma_fp_severe: float = 0.4,
+    fbeta: float = 2.0,
+    lambda_abnormal: float = 1.5,
 ) -> list[float]:
     """Batch version used by GRPO reward manager."""
     if len(impression_preds) != len(impression_gts):
@@ -58,7 +87,18 @@ def compute_clinical_rewards(
         assert role == "pred"
         pred_labels = label_vectors[cursor]
         gt_labels = label_vectors[cursor + 1]
-        scores[sample_idx] = micro_f1_positive(pred_labels, gt_labels)
+        if use_v2:
+            scores[sample_idx] = clinical_score_v2(
+                pred_labels,
+                gt_labels,
+                r_normal=r_normal,
+                gamma_fp=gamma_fp,
+                gamma_fp_severe=gamma_fp_severe,
+                fbeta=fbeta,
+                lambda_abnormal=lambda_abnormal,
+            )
+        else:
+            scores[sample_idx] = micro_f1_positive(pred_labels, gt_labels)
         cursor += 2
 
     return scores
@@ -68,6 +108,7 @@ def compute_clinical_rewards_from_responses(
     responses: Sequence[str],
     ground_truths: Sequence[str],
     labeler: CheXbertLabeler | None = None,
+    **clinical_kwargs,
 ) -> list[float]:
     """Compute clinical rewards directly from model responses and EasyR1 ground_truth."""
     impression_preds: list[str] = []
@@ -91,15 +132,29 @@ def compute_clinical_rewards_from_responses(
     if not valid_indices:
         return scores
 
-    batch_scores = compute_clinical_rewards(impression_preds, impression_gts, labeler=labeler)
+    batch_scores = compute_clinical_rewards(
+        impression_preds, impression_gts, labeler=labeler, **clinical_kwargs
+    )
     for idx, score in zip(valid_indices, batch_scores):
         scores[idx] = score
     return scores
 
 
 if __name__ == "__main__":
-    from .chexbert_utils import micro_f1_positive
+    # GT normal, pred normal -> 1.0
+    normal = [0] * 14
+    print("normal/normal:", clinical_score_v2(normal, normal))
 
-    pred = [0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
-    gt = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    print("mock micro-F1:", micro_f1_positive(pred, gt))
+    # GT normal, pred cardiomegaly (index 1)
+    pred_fp = [0] * 14
+    pred_fp[1] = 1
+    print("normal/FP cardiomegaly:", clinical_score_v2(pred_fp, normal))
+
+    # GT abnormal: cardiomegaly+opacity, pred only cardiomegaly
+    gt_abn = [0] * 14
+    gt_abn[1] = 1
+    gt_abn[2] = 1
+    pred_partial = [0] * 14
+    pred_partial[1] = 1
+    print("abnormal partial:", clinical_score_v2(pred_partial, gt_abn))
+    print("abnormal perfect:", clinical_score_v2(gt_abn, gt_abn))

@@ -1,0 +1,463 @@
+diff --git a/verl/trainer/main.py b/verl/trainer/main.py
+index 045180e..18abdb5 100644
+--- a/verl/trainer/main.py
++++ b/verl/trainer/main.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import json
++import os
+ 
+ import ray
+ from omegaconf import OmegaConf
+@@ -101,17 +102,28 @@ def main():
+     ppo_config.deep_post_init()
+ 
+     if not ray.is_initialized():
+-        runtime_env = {
+-            "env_vars": {
+-                "TOKENIZERS_PARALLELISM": "true",
+-                "NCCL_DEBUG": "WARN",
+-                "VLLM_LOGGING_LEVEL": "WARN",
+-                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+-                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+-                "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+-            }
++        env_vars = {
++            "TOKENIZERS_PARALLELISM": "true",
++            "NCCL_DEBUG": "WARN",
++            "VLLM_LOGGING_LEVEL": "WARN",
++            "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
++            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
++            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
++            "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+         }
++        # Forward host env so Ray reward workers can find CheXbert / HF mirror.
++        for key in (
++            "CHEXBERT_CHECKPOINT",
++            "HF_ENDPOINT",
++            "HF_HUB_DISABLE_XET",
++            "HF_HOME",
++            "PROJECT_ROOT",
++            "TRANSFORMERS_CACHE",
++            "HUGGINGFACE_HUB_CACHE",
++        ):
++            if key in os.environ and os.environ[key]:
++                env_vars[key] = os.environ[key]
++        runtime_env = {"env_vars": env_vars}
+         ray.init(runtime_env=runtime_env)
+ 
+     runner = Runner.remote()
+diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+index d96956c..2791167 100644
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++"""FSDP checkpoint manager with PeftModel / vLLM-era single-GPU NO_SHARD fixes."""
++
+ import json
+ import os
+ from dataclasses import asdict
+@@ -29,11 +31,44 @@ from torch.distributed.checkpoint.state_dict import (
+     set_state_dict,
+ )
+ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
++from torch.distributed.fsdp import ShardingStrategy
+ from transformers import PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
+ 
+ from .checkpoint_manager import BaseCheckpointManager
+ 
+ 
++def _is_no_shard(model: FSDP) -> bool:
++    """Single-GPU FSDP often uses NO_SHARD; summon_full_params(offload_to_cpu=True) then fails."""
++    strategy = getattr(model, "sharding_strategy", None)
++    if strategy == ShardingStrategy.NO_SHARD:
++        return True
++    # world_size==1 almost always NO_SHARD in this codebase's single-card setup
++    return dist.get_world_size() == 1
++
++
++def _to_cpu_tensor(weight: torch.Tensor) -> torch.Tensor:
++    if isinstance(weight, DTensor):
++        return weight.full_tensor().detach().cpu()
++    return weight.detach().cpu()
++
++
++def _collect_lora_state_dict(model: FSDP) -> dict[str, torch.Tensor]:
++    """Collect LoRA adapter weights safely under PeftModel + NO_SHARD."""
++    peft_model = model._fsdp_wrapped_module
++    assert isinstance(peft_model, PeftModel)
++
++    if _is_no_shard(model):
++        # Skip summon_full_params: offload_to_cpu=True + NO_SHARD is unsupported;
++        # even with offload_to_cpu=False, direct peft extract is enough on NO_SHARD.
++        raw = get_peft_model_state_dict(peft_model)
++        return {name: _to_cpu_tensor(weight) for name, weight in raw.items()}
++
++    # Multi-GPU sharded: materialize full params without CPU offload.
++    with FSDP.summon_full_params(model, writeback=False, offload_to_cpu=False):
++        raw = get_peft_model_state_dict(peft_model)
++        return {name: _to_cpu_tensor(weight) for name, weight in raw.items()}
++
++
+ class FSDPCheckpointManager(BaseCheckpointManager):
+     """
+     A checkpoint manager that saves and loads
+@@ -47,6 +82,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+     - sharded model states and optimizer states
+     - full lr_scheduler states
+     - huggingface tokenizer and config for ckpt merge
++
++    PeftModel (LoRA) path (vLLM 0.23 / single-card patch):
++    - Do NOT dump full model state_dict (frozen vision tower missing keys → AssertionError)
++    - Save ``lora_adapter/`` + optimizer + extra_state only
++    - Use ``cpu_offload=False`` and skip ``summon_full_params`` under NO_SHARD
+     """
+ 
+     def __init__(
+@@ -73,7 +113,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+         optim_state_dict = torch.load(optim_path, weights_only=False)
+         extra_state_dict = torch.load(extra_path, weights_only=False)
+ 
+-        state_dict_options = StateDictOptions(cpu_offload=True)
++        # Prefer False for NO_SHARD compatibility when reloading sharded dicts.
++        state_dict_options = StateDictOptions(cpu_offload=False)
+         set_state_dict(
+             model=self.model,
+             optimizers=self.optimizer,
+@@ -87,16 +128,86 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+         if "rng" in extra_state_dict:
+             self.load_rng_state(extra_state_dict["rng"])
+ 
++    def _save_peft_checkpoint(self, path: str, save_model_only: bool = False):
++        """LoRA-only checkpoint path for PeftModel (actor)."""
++        optim_path = os.path.join(path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
++        extra_path = os.path.join(path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
++
++        # Avoid get_model_state_dict on full PeftModel (frozen vision not in state_dict).
++        if not save_model_only:
++            # Optimizer-only: save optimizer state directly (avoid full model state_dict).
++            optim_state_dict = self.optimizer.state_dict()
++            # Move any CUDA tensors in optim state to CPU for portability.
++            def _cpu_state(obj):
++                if isinstance(obj, torch.Tensor):
++                    return obj.detach().cpu()
++                if isinstance(obj, dict):
++                    return {k: _cpu_state(v) for k, v in obj.items()}
++                if isinstance(obj, (list, tuple)):
++                    t = [_cpu_state(v) for v in obj]
++                    return type(obj)(t)
++                return obj
++
++            optim_state_dict = _cpu_state(optim_state_dict)
++            extra_state_dict = {
++                "lr_scheduler": self.lr_scheduler.state_dict(),
++                "rng": self.get_rng_state(),
++            }
++            print(f"[rank-{self.rank}]: Saving optimizer to {os.path.abspath(optim_path)}.")
++            print(f"[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}.")
++            torch.save(optim_state_dict, optim_path)
++            torch.save(extra_state_dict, extra_path)
++
++        dist.barrier()
++
++        if self.rank == 0:
++            hf_path = os.path.join(path, "huggingface")
++            os.makedirs(hf_path, exist_ok=True)
++            assert isinstance(self.model._fsdp_wrapped_module, PeftModel)
++            base = self.model._fsdp_wrapped_module
++            base.config.save_pretrained(hf_path)
++            if getattr(base, "generation_config", None) is not None:
++                base.generation_config.save_pretrained(hf_path)
++            self.processing_class.save_pretrained(hf_path)
++
++        # Save LoRA adapter (all ranks participate in collective extract; rank0 writes).
++        lora_path = os.path.join(path, "lora_adapter")
++        peft_config = {}
++        if self.rank == 0:
++            os.makedirs(lora_path, exist_ok=True)
++            peft_config = asdict(self.model._fsdp_wrapped_module.peft_config.get("default", {}))
++            if peft_config:
++                if hasattr(peft_config.get("task_type"), "value"):
++                    peft_config["task_type"] = peft_config["task_type"].value
++                if hasattr(peft_config.get("peft_type"), "value"):
++                    peft_config["peft_type"] = peft_config["peft_type"].value
++                if isinstance(peft_config.get("target_modules"), (set, tuple)):
++                    peft_config["target_modules"] = list(peft_config["target_modules"])
++
++        lora_weights = _collect_lora_state_dict(self.model)
++        torch.cuda.empty_cache()
++        if self.rank == 0:
++            save_file(lora_weights, os.path.join(lora_path, "adapter_model.safetensors"))
++            with open(os.path.join(lora_path, "adapter_config.json"), "w", encoding="utf-8") as f:
++                json.dump(peft_config, f, ensure_ascii=False, indent=4)
++            print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_path}")
++
++        dist.barrier()
++
+     def save_checkpoint(self, path: str, save_model_only: bool = False):
+         path = self.local_mkdir(path)
+         dist.barrier()
+ 
+-        # every rank will save its own model and optim shard
++        if isinstance(self.model._fsdp_wrapped_module, PeftModel):
++            self._save_peft_checkpoint(path, save_model_only=save_model_only)
++            return
++
++        # Full (non-LoRA) model path — use cpu_offload=False for NO_SHARD safety.
+         model_path = os.path.join(path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+         optim_path = os.path.join(path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
+         extra_path = os.path.join(path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
+ 
+-        state_dict_options = StateDictOptions(cpu_offload=True)
++        state_dict_options = StateDictOptions(cpu_offload=False)
+         if save_model_only:
+             model_state_dict = get_model_state_dict(self.model, options=state_dict_options)
+             print(f"[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}.")
+@@ -114,7 +225,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+             torch.save(optim_state_dict, optim_path)
+             torch.save(extra_state_dict, extra_path)
+ 
+-        # wait for everyone to dump to local
+         dist.barrier()
+ 
+         if self.rank == 0:
+@@ -125,34 +235,4 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+             self.model._fsdp_wrapped_module.generation_config.save_pretrained(hf_path)
+             self.processing_class.save_pretrained(hf_path)
+ 
+-        if isinstance(self.model._fsdp_wrapped_module, PeftModel):
+-            lora_path = os.path.join(path, "lora_adapter")
+-            peft_config = {}
+-            if self.rank == 0:
+-                os.makedirs(lora_path, exist_ok=True)
+-                peft_config = asdict(self.model._fsdp_wrapped_module.peft_config.get("default", {}))
+-                peft_config["task_type"] = peft_config["task_type"].value
+-                peft_config["peft_type"] = peft_config["peft_type"].value
+-                peft_config["target_modules"] = list(peft_config["target_modules"])
+-
+-            sharded_lora_weights = get_peft_model_state_dict(
+-                self.model._fsdp_wrapped_module, state_dict=model_state_dict
+-            )
+-            cuda_device = torch.device("cuda")
+-            lora_weights = {
+-                name: sharded_weight.to(cuda_device).full_tensor().detach().cpu()
+-                if isinstance(sharded_weight, DTensor)
+-                else sharded_weight.detach().cpu()
+-                for name, sharded_weight in sharded_lora_weights.items()
+-            }
+-            torch.cuda.empty_cache()
+-            if self.rank == 0:
+-                save_file(lora_weights, os.path.join(lora_path, "adapter_model.safetensors"))
+-                with open(os.path.join(lora_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+-                    json.dump(peft_config, f, ensure_ascii=False, indent=4)
+-
+-            dist.barrier()
+-            if self.rank == 0:
+-                print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_path}")
+-
+         dist.barrier()
+diff --git a/verl/utils/vllm_utils.py b/verl/utils/vllm_utils.py
+deleted file mode 100644
+index 6cb2242..0000000
+--- a/verl/utils/vllm_utils.py
++++ /dev/null
+@@ -1,130 +0,0 @@
+-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-from importlib.metadata import version
+-from typing import List
+-
+-from msgspec import field
+-from packaging import version as vs
+-from vllm.lora.models import LoRAModel
+-from vllm.lora.request import LoRARequest
+-from vllm.lora.utils import get_adapter_absolute_path
+-from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+-
+-
+-class TensorLoRARequest(LoRARequest):
+-    peft_config: dict = field(default=None)
+-    lora_tensors: dict = field(default=None)
+-
+-
+-class VLLMHijack:
+-    @staticmethod
+-    def hijack():
+-        def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
+-            """
+-            based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
+-            Reason:
+-            VLLM does not support adding LoRA from tensors directly. It only supports adding LoRA via file paths.
+-            To synchronize the LoRA tensors of the actor model, we need to find a workaround to enable VLLM to load memory-based LoRA tensors.
+-            """
+-            supported_lora_modules = self._adapter_manager.supported_lora_modules
+-            packed_modules_mapping = self._adapter_manager.packed_modules_mapping
+-            expected_lora_modules: List[str] = []
+-            for module in supported_lora_modules:
+-                if module in packed_modules_mapping:
+-                    expected_lora_modules.extend(packed_modules_mapping[module])
+-                else:
+-                    expected_lora_modules.append(module)
+-
+-            expected_lora_modules = list(set(expected_lora_modules))
+-
+-            lora_tensors = None
+-            from vllm.lora.peft_helper import PEFTHelper
+-
+-            if isinstance(lora_request, TensorLoRARequest):
+-                peft_config = lora_request.peft_config
+-                lora_tensors = lora_request.lora_tensors
+-                peft_helper = PEFTHelper.from_dict(peft_config)
+-            else:
+-                lora_path = get_adapter_absolute_path(lora_request.lora_path)
+-
+-                peft_helper = PEFTHelper.from_local_dir(lora_path, self.max_position_embeddings)
+-
+-            # Validates the LoRA configuration against requirements before
+-            # loading weights, throwing an exception if validation fails.
+-            peft_helper.validate_legal(self.lora_config)
+-
+-            # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
+-            # to ensure correct loading of lora weights.
+-            model = self._adapter_manager.model
+-            hf_to_vllm_mapper = None
+-            if hasattr(model, "hf_to_vllm_mapper") and model.hf_to_vllm_mapper is not None:
+-                hf_to_vllm_mapper = model.hf_to_vllm_mapper
+-
+-            if isinstance(lora_request, TensorLoRARequest):
+-                lora = self._lora_model_cls.from_lora_tensors(
+-                    lora_model_id=lora_request.lora_int_id,
+-                    tensors=lora_tensors,
+-                    peft_helper=peft_helper,
+-                    device="cpu",
+-                    dtype=self.lora_config.lora_dtype,
+-                    embeddings=None,
+-                    target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
+-                    embedding_modules=self.embedding_modules,
+-                    embedding_padding_modules=self.embedding_padding_modules,
+-                    weights_mapper=hf_to_vllm_mapper,
+-                )
+-            else:
+-                lora = self._lora_model_cls.from_local_checkpoint(
+-                    lora_path,
+-                    expected_lora_modules,
+-                    peft_helper=peft_helper,
+-                    lora_model_id=lora_request.lora_int_id,
+-                    device="cpu",
+-                    dtype=self.lora_config.lora_dtype,
+-                    target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
+-                    embedding_modules=self.embedding_modules,
+-                    embedding_padding_modules=self.embedding_padding_modules,
+-                    weights_mapper=hf_to_vllm_mapper,
+-                )
+-
+-            if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
+-                raise ValueError(
+-                    f"LoRA added vocab size {lora.extra_vocab_size} "
+-                    f"is greater than lora_extra_vocab_size "
+-                    f"{self.lora_config.lora_extra_vocab_size}."
+-                )
+-            return lora
+-
+-        setattr(LRUCacheWorkerLoRAManager, "_load_adapter", hijack__load_adapter)
+-
+-        if vs.parse(version("vllm")).base_version == "0.11.0":
+-            from vllm.model_executor.models.module_mapping import MultiModelKeys
+-            from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
+-
+-            def hijack__get_mm_mapping(self) -> MultiModelKeys:
+-                """
+-                Patch vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration.get_mm_mapping in vLLM 0.11.0
+-                Reason:
+-                vLLM 0.11.0 uses "model.visual.*" prefixes for Qwen3-VL, but the real module names are "visual.*".
+-                This breaks LoRA filtering for multimodal parts, so we align the prefixes to the real module names.
+-                Fixed upstream: https://github.com/vllm-project/vllm/commit/9f4e309
+-                """
+-                return MultiModelKeys.from_string_field(
+-                    language_model="language_model",
+-                    connector="visual.merger.",
+-                    tower_model="visual.",
+-                )
+-
+-            setattr(Qwen3VLForConditionalGeneration, "get_mm_mapping", hijack__get_mm_mapping)
+diff --git a/verl/workers/rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout_spmd.py
+index 4bf820c..857f662 100644
+--- a/verl/workers/rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout_spmd.py
+@@ -163,19 +163,27 @@ class vLLMRollout(BaseRollout):
+ 
+     @contextmanager
+     def update_sampling_params(self, **kwargs):
+-        # update sampling params
++        # update sampling params; skip read-only fields (e.g. eos_token_id in vLLM>=0.23)
+         old_sampling_params_args = {}
+         if kwargs:
+             for key, value in kwargs.items():
+-                if hasattr(self.sampling_params, key):
++                if not hasattr(self.sampling_params, key):
++                    continue
++                try:
+                     old_value = getattr(self.sampling_params, key)
+-                    old_sampling_params_args[key] = old_value
+                     setattr(self.sampling_params, key, value)
++                except (AttributeError, TypeError, ValueError):
++                    # msgspec Struct / property may reject writes
++                    continue
++                old_sampling_params_args[key] = old_value
+ 
+         yield
+         # roll back to previous sampling params
+         for key, value in old_sampling_params_args.items():
+-            setattr(self.sampling_params, key, value)
++            try:
++                setattr(self.sampling_params, key, value)
++            except (AttributeError, TypeError, ValueError):
++                continue
+ 
+     @torch.no_grad()
+     def generate_sequences(self, prompts: DataProto) -> DataProto:
+diff --git a/verl/workers/sharding_manager/fsdp_vllm.py b/verl/workers/sharding_manager/fsdp_vllm.py
+index 41d222c..a399309 100644
+--- a/verl/workers/sharding_manager/fsdp_vllm.py
++++ b/verl/workers/sharding_manager/fsdp_vllm.py
+@@ -57,9 +57,20 @@ class FSDPVLLMShardingManager(BaseShardingManager):
+         self.is_lora = isinstance(self.module._fsdp_wrapped_module, PeftModel)
+ 
+         self.world_size = dist.get_world_size()
+-        self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
+-        self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
+-        self.tp_group = vllm_ps.get_tensor_model_parallel_group().device_group
++        # vLLM 0.11: get_tensor_model_parallel_*; vLLM 0.23+: get_tp_group().device_group
++        if hasattr(vllm_ps, "get_tensor_model_parallel_world_size"):
++            self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
++            self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
++        else:
++            tp_group = vllm_ps.get_tp_group()
++            self.tp_size = tp_group.world_size
++            self.tp_rank = tp_group.rank_in_group
++
++        if hasattr(vllm_ps, "get_tensor_model_parallel_group"):
++            group = vllm_ps.get_tensor_model_parallel_group()
++            self.tp_group = group.device_group if hasattr(group, "device_group") else group
++        else:
++            self.tp_group = vllm_ps.get_tp_group().device_group
+ 
+         # Record freed bytes to estimate memory usage correctly
+         # https://github.com/vllm-project/vllm/pull/11743#issuecomment-2754338119

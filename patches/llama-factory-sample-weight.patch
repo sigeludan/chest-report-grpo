@@ -1,0 +1,164 @@
+diff --git a/src/llamafactory/data/collator.py b/src/llamafactory/data/collator.py
+index af234d9..e17b770 100644
+--- a/src/llamafactory/data/collator.py
++++ b/src/llamafactory/data/collator.py
+@@ -325,10 +325,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+         batch_images, batch_videos, batch_audios = [], [], []
+         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+         packing_params_list: list[dict[str, Any] | None] = []
++        sample_weights: list[float] = []
+         for feature in features:
+             images = feature.pop("images", None) or []
+             videos = feature.pop("videos", None) or []
+             audios = feature.pop("audios", None) or []
++            sample_weights.append(float(feature.pop("sample_weight", 1.0)))
+             batch_images.extend(images)
+             batch_videos.extend(videos)
+             batch_audios.extend(audios)
+@@ -414,6 +416,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+             mm_inputs["mm_token_type_ids"] = torch.tensor(padded, dtype=torch.long)
+ 
+         features: dict[str, torch.Tensor] = super().__call__(features)
++        features["sample_weight"] = torch.tensor(sample_weights, dtype=torch.float32)
+ 
+         bsz, seq_len = features["input_ids"].shape[:2]
+         model_type = getattr(self.model.config, "model_type", None) if self.model is not None else None
+@@ -532,6 +535,8 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
+             features["attention_mask"] = None  # let transformers handle causal packed mask.
+ 
+         for key, value in features.items():  # cast data dtype for paligemma
++            if key == "sample_weight":
++                continue
+             if torch.is_tensor(value) and torch.is_floating_point(value):
+                 features[key] = value.to(self.compute_dtype)
+ 
+diff --git a/src/llamafactory/data/converter.py b/src/llamafactory/data/converter.py
+index ad49ded..d87def0 100644
+--- a/src/llamafactory/data/converter.py
++++ b/src/llamafactory/data/converter.py
+@@ -215,6 +215,11 @@ class SharegptDatasetConverter(DatasetConverter):
+             prompt = aligned_messages[:-1]
+             response = aligned_messages[-1:]
+ 
++        if self.dataset_attr.sample_weight and example.get(self.dataset_attr.sample_weight) is not None:
++            sample_weight = float(example[self.dataset_attr.sample_weight])
++        else:
++            sample_weight = 1.0
++
+         output = {
+             "_prompt": prompt,
+             "_response": response,
+@@ -223,6 +228,7 @@ class SharegptDatasetConverter(DatasetConverter):
+             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
+             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
+             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
++            "_sample_weight": sample_weight,
+         }
+         return output
+ 
+diff --git a/src/llamafactory/data/parser.py b/src/llamafactory/data/parser.py
+index 5209da6..c67e56c 100644
+--- a/src/llamafactory/data/parser.py
++++ b/src/llamafactory/data/parser.py
+@@ -43,6 +43,7 @@ class DatasetAttr:
+     images: str | None = None
+     videos: str | None = None
+     audios: str | None = None
++    sample_weight: str | None = None
+     # dpo columns
+     chosen: str | None = None
+     rejected: str | None = None
+@@ -79,7 +80,7 @@ class DatasetAttr:
+ 
+         if "columns" in attr:
+             column_names = ["prompt", "query", "response", "history", "messages", "system", "tools"]
+-            column_names += ["images", "videos", "audios", "chosen", "rejected", "kto_tag"]
++            column_names += ["images", "videos", "audios", "sample_weight", "chosen", "rejected", "kto_tag"]
+             for column_name in column_names:
+                 self.set_attr(column_name, attr["columns"])
+ 
+diff --git a/src/llamafactory/data/processor/supervised.py b/src/llamafactory/data/processor/supervised.py
+index 26f14c6..5c9f192 100644
+--- a/src/llamafactory/data/processor/supervised.py
++++ b/src/llamafactory/data/processor/supervised.py
+@@ -131,6 +131,10 @@ class SupervisedDatasetProcessor(DatasetProcessor):
+             model_inputs["images"].append(examples["_images"][i])
+             model_inputs["videos"].append(examples["_videos"][i])
+             model_inputs["audios"].append(examples["_audios"][i])
++            if "_sample_weight" in examples:
++                model_inputs["sample_weight"].append(float(examples["_sample_weight"][i]))
++            else:
++                model_inputs["sample_weight"].append(1.0)
+ 
+         return model_inputs
+ 
+diff --git a/src/llamafactory/train/sft/trainer.py b/src/llamafactory/train/sft/trainer.py
+index 993cba8..124c99c 100644
+--- a/src/llamafactory/train/sft/trainer.py
++++ b/src/llamafactory/train/sft/trainer.py
+@@ -148,7 +148,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         return super()._get_train_sampler(*args, **kwargs)
+ 
+     @override
+-    def compute_loss(self, model, inputs, *args, **kwargs):
++    def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
++        sample_weight = inputs.pop("sample_weight", None)
++
+         if self.finetuning_args.use_asft_loss:
+             with torch.no_grad():
+                 ref_outputs = self.ref_model(
+@@ -157,9 +159,42 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+                 )
+                 ref_logits = ref_outputs.logits
+             outputs = model(**inputs)
+-            return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
+-        else:
+-            return super().compute_loss(model, inputs, *args, **kwargs)
++            loss = self.compute_loss_func(outputs, inputs["labels"], ref_logits)
++            return (loss, outputs) if return_outputs else loss
++
++        if sample_weight is None:
++            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
++
++        labels = inputs.get("labels")
++        outputs = model(**inputs)
++        logits = outputs.logits
++
++        # Shift so that tokens < n predict n (standard causal LM).
++        shift_logits = logits[..., :-1, :].contiguous()
++        shift_labels = labels[..., 1:].contiguous()
++        vocab_size = shift_logits.size(-1)
++        flat_logits = shift_logits.view(-1, vocab_size)
++        flat_labels = shift_labels.view(-1)
++
++        token_loss = torch.nn.functional.cross_entropy(
++            flat_logits,
++            flat_labels,
++            ignore_index=IGNORE_INDEX,
++            reduction="none",
++        ).view_as(shift_labels)
++
++        valid_mask = shift_labels.ne(IGNORE_INDEX)
++        per_sample_sum = (token_loss * valid_mask).sum(dim=-1)
++        per_sample_count = valid_mask.sum(dim=-1).clamp_min(1)
++        per_sample_loss = per_sample_sum / per_sample_count
++
++        weights = sample_weight.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
++        # Samples with no supervised tokens get zero contribution.
++        has_supervised = valid_mask.any(dim=-1).to(dtype=per_sample_loss.dtype)
++        weights = weights * has_supervised
++        loss = (per_sample_loss * weights).sum() / weights.sum().clamp_min(1e-6)
++
++        return (loss, outputs) if return_outputs else loss
+ 
+     @override
+     def prediction_step(
+@@ -179,6 +214,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         else:
+             labels = inputs.get("labels")
+ 
++        inputs.pop("sample_weight", None)
++
+         loss, generated_tokens, _ = super().prediction_step(
+             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
+         )

@@ -41,9 +41,14 @@ done
 
 cd "${EASYR1_DIR}"
 
-# λ₁=1.0, λ₂=0.3 — explicit CLI override so reward kwargs cannot silently fall back to 0.
+# λ₁=1.0, λ₂=0.3 + clinical v2 kwargs — explicit CLI override so kwargs cannot silently fall back.
 python3 -m verl.trainer.main \
     config="${CONFIG}" \
     worker.reward.reward_function_kwargs.lambda_clinical=1.0 \
     worker.reward.reward_function_kwargs.lambda_consistency=0.3 \
+    worker.reward.reward_function_kwargs.r_normal=1.0 \
+    worker.reward.reward_function_kwargs.gamma_fp=0.25 \
+    worker.reward.reward_function_kwargs.gamma_fp_severe=0.4 \
+    worker.reward.reward_function_kwargs.fbeta=2.0 \
+    worker.reward.reward_function_kwargs.lambda_abnormal=1.5 \
     "$@"

@@ -123,6 +123,83 @@ def micro_f1_positive(labels_pred: Sequence[int], labels_gt: Sequence[int]) -> f
     return 2 * precision * recall / (precision + recall)
 
 
+# Disease heads only (exclude "No Finding") to avoid normal-vs-normal F1 collapse.
+DISEASE_INDICES: list[int] = [i for i, name in enumerate(CONDITIONS) if name != "No Finding"]
+
+# Optional heavier FP penalty on clinically urgent false positives (index into CONDITIONS).
+SEVERE_FP_INDICES: set[int] = {
+    CONDITIONS.index("Pneumothorax"),
+    CONDITIONS.index("Pleural Effusion"),
+    CONDITIONS.index("Edema"),
+}
+
+
+def _disease_counts(labels_pred: Sequence[int], labels_gt: Sequence[int]) -> tuple[int, int, int, int]:
+    """Return TP, FP, FN, and number of predicted disease positives (over 13 disease classes)."""
+    tp = fp = fn = 0
+    pred_pos_count = 0
+    for idx in DISEASE_INDICES:
+        pred_pos = labels_pred[idx] == 1
+        gt_pos = labels_gt[idx] == 1
+        if pred_pos:
+            pred_pos_count += 1
+        if pred_pos and gt_pos:
+            tp += 1
+        elif pred_pos and not gt_pos:
+            fp += 1
+        elif (not pred_pos) and gt_pos:
+            fn += 1
+    return tp, fp, fn, pred_pos_count
+
+
+def is_gt_abnormal(labels_gt: Sequence[int]) -> bool:
+    return any(labels_gt[idx] == 1 for idx in DISEASE_INDICES)
+
+
+def fbeta_score(precision: float, recall: float, beta: float = 2.0) -> float:
+    if precision <= 0.0 and recall <= 0.0:
+        return 0.0
+    b2 = beta * beta
+    denom = b2 * precision + recall
+    if denom <= 0.0:
+        return 0.0
+    return (1.0 + b2) * precision * recall / denom
+
+
+def clinical_score_v2(
+    labels_pred: Sequence[int],
+    labels_gt: Sequence[int],
+    *,
+    r_normal: float = 1.0,
+    gamma_fp: float = 0.25,
+    gamma_fp_severe: float = 0.4,
+    fbeta: float = 2.0,
+    lambda_abnormal: float = 1.5,
+) -> float:
+    """Asymmetric clinical score for GRPO.
+
+    - GT normal: correct normal -> r_normal; each disease FP subtracts gamma_fp (severe FP uses gamma_fp_severe).
+    - GT abnormal: lambda_abnormal * F_beta (beta>1 favors recall).
+    """
+    if len(labels_pred) != len(labels_gt):
+        raise ValueError("Prediction and ground-truth label vectors must have the same length.")
+
+    tp, fp, fn, pred_pos_count = _disease_counts(labels_pred, labels_gt)
+
+    if not is_gt_abnormal(labels_gt):
+        if pred_pos_count == 0:
+            return float(r_normal)
+        penalty = 0.0
+        for idx in DISEASE_INDICES:
+            if labels_pred[idx] == 1 and labels_gt[idx] != 1:
+                penalty += gamma_fp_severe if idx in SEVERE_FP_INDICES else gamma_fp
+        return float(max(0.0, r_normal - penalty))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return float(lambda_abnormal * fbeta_score(precision, recall, beta=fbeta))
+
+
 class CheXbertLabeler:
     """Lazy-loaded singleton CheXbert labeler with batch inference."""
 

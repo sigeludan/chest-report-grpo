@@ -1,0 +1,28 @@
+{
+  "policy": "original_distribution_no_upsample",
+  "note": "Same uid split as data/sft from preprocess_iu_xray.py. Do NOT use data/sft_balanced for GRPO.",
+  "splits": {
+    "train": {
+      "num_samples": 2230,
+      "abnormal_impression_kw": 477,
+      "normal_impression_kw": 1753,
+      "abnormal_ratio_kw": 0.2139,
+      "file": "data/grpo/train.jsonl"
+    },
+    "val": {
+      "num_samples": 318,
+      "abnormal_impression_kw": 64,
+      "normal_impression_kw": 254,
+      "abnormal_ratio_kw": 0.2013,
+      "file": "data/grpo/val.jsonl"
+    },
+    "test": {
+      "num_samples": 639,
+      "abnormal_impression_kw": 150,
+      "normal_impression_kw": 489,
+      "abnormal_ratio_kw": 0.2347,
+      "file": "data/grpo/test.jsonl"
+    }
+  },
+  "align_with_sft_train_images": true
+}
